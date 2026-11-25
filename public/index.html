@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kill Switch Agent: live dashboard</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>⏻</text></svg>">
+<script src="/vendor/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --line:#2a2f3a; --text:#e8eaed; --muted:#9aa0a6; --ok:#3fb950; --bad:#f85149; --warn:#d29922; --accent:#58a6ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }
+  header { display:flex; align-items:center; gap:16px; padding:16px 24px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  .pill { padding:3px 10px; border-radius:999px; font-size:12px; font-weight:600; }
+  .pill.ok { background:#12361d; color:var(--ok); } .pill.bad { background:#3d1416; color:var(--bad); } .pill.warn { background:#3a2c0d; color:var(--warn); }
+  main { display:grid; grid-template-columns: 2fr 1fr; gap:16px; padding:16px 24px; }
+  @media (max-width: 960px) { main { grid-template-columns: 1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:0 0 12px; }
+  .timing { margin-top:6px; padding:6px 8px; background:#12361d; border-radius:6px; color:var(--ok); }
+  .kpis { display:grid; grid-template-columns: repeat(5, 1fr); gap:12px; margin-bottom:16px; }
+  .kpi .v { font-size:26px; font-weight:700; } .kpi .l { color:var(--muted); font-size:12px; }
+  .flags { display:flex; gap:8px; flex-wrap:wrap; }
+  .flag { border:1px solid var(--line); border-radius:8px; padding:6px 10px; font-family:ui-monospace, monospace; font-size:12px; }
+  button { background:#21262d; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:8px 12px; cursor:pointer; font-weight:600; }
+  button:hover { border-color:var(--accent); }
+  button.danger { border-color:#6e2a2a; } button.primary { background:#1f6feb; border-color:#1f6feb; }
+  .incident { border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:10px; }
+  .incident .exp { white-space:pre-wrap; margin:8px 0; }
+  .timeline { list-style:none; padding:0; margin:0; max-height:340px; overflow:auto; font-size:12px; }
+  .timeline li { padding:6px 0; border-bottom:1px solid var(--line); }
+  .timeline .t { color:var(--muted); font-family:ui-monospace, monospace; margin-right:6px; }
+  .muted { color:var(--muted); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Kill Switch Agent</h1>
+  <span id="health" class="pill ok">Healthy</span>
+  <span id="mode" class="muted"></span>
+  <div class="row" style="margin-left:auto">
+    <button class="danger" onclick="post('/api/demo/break')">Break new checkout</button>
+    <button onclick="post('/api/demo/reset')">Reset demo</button>
+    <a href="/shop" target="_blank" style="color:var(--accent)">Open shop</a>
+  </div>
+</header>
+<main>
+  <section>
+    <div class="kpis">
+      <div class="card kpi"><div class="v" id="k-rate">0%</div><div class="l">Error rate, last 60s</div></div>
+      <div class="card kpi"><div class="v" id="k-on">0%</div><div class="l">Error rate, new_checkout ON</div></div>
+      <div class="card kpi"><div class="v" id="k-off">0%</div><div class="l">Error rate, new_checkout OFF</div></div>
+      <div class="card kpi"><div class="v" id="k-req">0</div><div class="l">Requests, last 60s</div></div>
+      <div class="card kpi"><div class="v" id="k-mttr">–</div><div class="l">Alert to errors stopped</div></div>
+    </div>
+    <div class="card">
+      <h2>Error rate over time (5-second buckets)</h2>
+      <canvas id="chart" height="120"></canvas>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h2>Flags in Flagsmith</h2>
+      <div class="flags" id="flags"><span class="muted">Loading…</span></div>
+    </div>
+  </section>
+  <aside>
+    <div class="card">
+      <h2>Incidents</h2>
+      <div id="incidents"><span class="muted">None yet. The agent is watching.</span></div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h2>Agent timeline</h2>
+      <ul class="timeline" id="audit"></ul>
+    </div>
+  </aside>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const pct = (e, t) => (t ? (100 * e / t) : 0);
+const fmt = (v) => v.toFixed(1) + '%';
+const time = (ms) => new Date(ms).toLocaleTimeString();
+const secs = (ms) => ms < 60000 ? `${Math.round(ms / 1000)}s` : `${Math.floor(ms / 60000)}m ${Math.round((ms % 60000) / 1000)}s`;
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c]));
+
+async function post(url, body) {
+  const r = await fetch(url, { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify(body || {}) });
+  if (!r.ok) alertBox((await r.json()).error || 'Request failed');
+  refresh();
+}
+function alertBox(msg) { $('mode').textContent = msg; }
+
+const chart = new Chart($('chart'), {
+  type: 'line',
+  data: { labels: [], datasets: [
+    { label: 'All users', data: [], borderColor: '#e8eaed', tension: .3, pointRadius: 0, borderWidth: 2 },
+    { label: 'new_checkout ON', data: [], borderColor: '#f85149', tension: .3, pointRadius: 0, borderWidth: 2 },
+    { label: 'new_checkout OFF', data: [], borderColor: '#3fb950', tension: .3, pointRadius: 0, borderWidth: 2, borderDash: [5, 4] },
+  ]},
+  options: { animation: false, responsive: true,
+    scales: { y: { min: 0, suggestedMax: 40, ticks: { callback: (v) => v + '%', color:'#9aa0a6' }, grid: { color:'#2a2f3a' } },
+              x: { ticks: { color:'#9aa0a6', maxTicksLimit: 8 }, grid: { display:false } } },
+    plugins: { legend: { labels: { color:'#e8eaed' } } } },
+});
+
+async function refresh() {
+  const s = await (await fetch('/api/stats?seconds=300')).json();
+  $('mode').textContent = s.localTestMode ? 'LOCAL TEST MODE (not using Flagsmith)' : 'Connected to Flagsmith';
+  chart.data.labels = s.series.map((r) => time(r.t));
+  chart.data.datasets[0].data = s.series.map((r) => pct(r.errors, r.total));
+  // Skip buckets with fewer than 10 requests in a group: 1 error out of 6 would draw a misleading 17% spike.
+  const MIN = 10;
+  chart.data.datasets[1].data = s.series.map((r) => r.on_total >= MIN ? pct(r.on_errors, r.on_total) : null);
+  chart.data.datasets[2].data = s.series.map((r) => (r.total - r.on_total) >= MIN ? pct(r.errors - r.on_errors, r.total - r.on_total) : null);
+  chart.options.spanGaps = true;
+  chart.update();
+
+  const last = s.series.filter((r) => r.t >= Date.now() - 60000);
+  const sum = (k) => last.reduce((a, r) => a + (r[k] || 0), 0);
+  const total = sum('total'), errors = sum('errors'), onT = sum('on_total'), onE = sum('on_errors');
+  const rate = pct(errors, total);
+  $('k-rate').textContent = fmt(rate);
+  $('k-on').textContent = fmt(pct(onE, onT));
+  $('k-off').textContent = fmt(pct(errors - onE, total - onT));
+  $('k-req').textContent = total;
+  const rec = s.incidents.find((i) => i.status === 'recovered');
+  $('k-mttr').textContent = rec ? secs((rec.propagated_at || rec.closed_at) - rec.opened_at) : '–';
+
+  const open = s.incidents.find((i) => i.status === 'waiting_approval');
+  const h = $('health');
+  if (open) { h.className = 'pill warn'; h.textContent = 'Waiting for human approval'; }
+  else if (rate > 5) { h.className = 'pill bad'; h.textContent = 'Errors high'; }
+  else { h.className = 'pill ok'; h.textContent = 'Healthy'; }
+
+  $('incidents').innerHTML = s.incidents.length ? s.incidents.map((i) => {
+    const st = JSON.parse(i.stats || '{}');
+    const buttons = i.status === 'waiting_approval' && !s.dashboardApproval
+      ? '<div class="muted">Waiting for approval in Slack…</div>'
+      : i.status === 'waiting_approval'
+      ? `<div class="row"><button class="primary" onclick="post('/api/incidents/${i.id}/decision',{decision:'approve'})">Approve: turn off ${esc(i.flag)}</button>
+         <button onclick="post('/api/incidents/${i.id}/decision',{decision:'ignore'})">Ignore</button></div>
+         <div class="muted" style="margin-top:6px">Backup buttons. The main approval happens in Slack.</div>` : '';
+    return `<div class="incident"><b>#${i.id}</b> · ${esc(i.flag || 'no clear suspect')} · <span class="pill ${i.status === 'recovered' ? 'ok' : i.status === 'waiting_approval' ? 'warn' : 'bad'}">${esc(i.status)}</span>
+      <div class="muted">${time(i.opened_at)}${st.suspect ? ` · ON ${fmt(st.suspect.onRate*100)} vs OFF ${fmt(st.suspect.offRate*100)}` : ''}</div>
+      ${i.status === 'recovered' ? `<div class="timing">Approved after <b>${secs(i.decided_at - i.opened_at)}</b> by ${esc(i.decided_by)} · Flagsmith delivered OFF in <b>${secs(i.propagated_at - i.disabled_at)}</b> · errors stopped <b>${secs(i.propagated_at - i.opened_at)}</b> after alert</div>` : ''}
+      <div class="exp">${esc(i.explanation || '')}</div>${buttons}</div>`;
+  }).join('') : '<span class="muted">None yet. The agent is watching.</span>';
+
+  $('audit').innerHTML = s.audit.map((a) => `<li><span class="t">${time(a.ts)}</span>${a.incident_id ? `#${a.incident_id} ` : ''}<b>${esc(a.step)}</b> ${esc(a.detail)}</li>`).join('');
+}
+
+async function refreshFlags() {
+  try {
+    const f = await (await fetch('/api/flags')).json();
+    if (f.error) { $('flags').innerHTML = `<span class="muted">${esc(f.error)}</span>`; return; }
+    $('flags').innerHTML = Object.entries(f).map(([k, v]) =>
+      `<div class="flag">${esc(k)}: <b style="color:${v.enabled ? 'var(--ok)' : 'var(--bad)'}">${v.enabled ? 'ON' : 'OFF'}</b></div>`).join('');
+  } catch { /* ignore */ }
+}
+refresh(); refreshFlags();
+setInterval(refresh, 2000); setInterval(refreshFlags, 5000);
+</script>
+</body>
+</html>
