@@ -14,6 +14,13 @@
   header h1 { font-size:18px; margin:0; }
   .pill { padding:3px 10px; border-radius:999px; font-size:12px; font-weight:600; }
   .pill.ok { background:#12361d; color:var(--ok); } .pill.bad { background:#3d1416; color:var(--bad); } .pill.warn { background:#3a2c0d; color:var(--warn); }
+  .incident.is-abuse { border-color:#5a4a1a; }
+  .inv { margin:8px 0; padding:8px 10px; border:1px solid var(--line); border-radius:8px; font-size:13px; }
+  .inv summary { cursor:pointer; color:var(--accent); font-weight:600; }
+  .inv ol { margin:6px 0 6px 18px; padding:0; }
+  .by { margin:6px 0; font-size:12px; color:var(--muted); }
+  .blockline { margin-top:12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; color:var(--warn); }
+  .abuse { margin-top:6px; padding:6px 8px; background:#3a2c0d; border-radius:6px; color:var(--warn); }
   main { display:grid; grid-template-columns: 2fr 1fr; gap:16px; padding:16px 24px; }
   @media (max-width: 960px) { main { grid-template-columns: 1fr; } }
   .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; }
@@ -52,7 +59,7 @@
       <div class="card kpi"><div class="v" id="k-rate">0%</div><div class="l">Error rate, last 60s</div></div>
       <div class="card kpi"><div class="v" id="k-on">0%</div><div class="l">Error rate, new_checkout ON</div></div>
       <div class="card kpi"><div class="v" id="k-off">0%</div><div class="l">Error rate, new_checkout OFF</div></div>
-      <div class="card kpi"><div class="v" id="k-req">0</div><div class="l">Requests, last 60s</div></div>
+      <div class="card kpi"><div class="v" id="k-req">0</div><div class="l">Requests, last 60s<br><span id="k-rej"></span></div></div>
       <div class="card kpi"><div class="v" id="k-mttr">–</div><div class="l">Alert to errors stopped</div></div>
     </div>
     <div class="card">
@@ -62,6 +69,7 @@
     <div class="card" style="margin-top:16px">
       <h2>Flags in Flagsmith</h2>
       <div class="flags" id="flags"><span class="muted">Loading…</span></div>
+      <div id="blocklist" class="blockline" hidden></div>
     </div>
   </section>
   <aside>
@@ -123,6 +131,9 @@ async function refresh() {
   $('k-on').textContent = fmt(pct(onE, onT));
   $('k-off').textContent = fmt(pct(errors - onE, total - onT));
   $('k-req').textContent = total;
+  const rj = s.rejected || {};
+  const parts = [[rj.limited, 'rate-limited'], [rj.blocked, 'blocked'], [rj.invalid, 'invalid']].filter(([n]) => n).map(([n, l]) => `${n} ${l}`);
+  $('k-rej').textContent = parts.length ? `+ ${parts.join(', ')}` : '';
   const rec = s.incidents.find((i) => i.status === 'recovered');
   $('k-mttr').textContent = rec ? secs((rec.propagated_at || rec.closed_at) - rec.opened_at) : '–';
 
@@ -134,19 +145,45 @@ async function refresh() {
 
   $('incidents').innerHTML = s.incidents.length ? s.incidents.map((i) => {
     const st = JSON.parse(i.stats || '{}');
-    const buttons = i.status === 'waiting_approval' && !s.dashboardApproval
-      ? '<div class="muted">Waiting for approval in Slack…</div>'
-      : i.status === 'waiting_approval'
-      ? `<div class="row"><button class="primary" onclick="post('/api/incidents/${i.id}/decision',{decision:'approve'})">Approve: turn off ${esc(i.flag)}</button>
-         <button onclick="post('/api/incidents/${i.id}/decision',{decision:'ignore'})">Ignore</button></div>
+    const abuse = i.kind === 'abuse';
+    const waiting = i.status === 'waiting_approval';
+    const decide = (d, label, cls = '') => `<button class="${cls}" onclick="post('/api/incidents/${i.id}/decision',{decision:'${d}'})">${label}</button>`;
+    const buttons = waiting && !s.dashboardApproval
+      ? '<div class="muted">Waiting for a decision in Slack…</div>'
+      : waiting && abuse
+      ? `<div class="row">${decide('block', 'Block these sources', 'primary')}${i.flag ? decide('approve', `Turn off ${esc(i.flag)} anyway`) : ''}${decide('ignore', 'Ignore')}</div>`
+      : waiting
+      ? `<div class="row">${decide('approve', `Approve: turn off ${esc(i.flag)}`, 'primary')}${decide('ignore', 'Ignore')}</div>
          <div class="muted" style="margin-top:6px">Backup buttons. The main approval happens in Slack.</div>` : '';
-    return `<div class="incident"><b>#${i.id}</b> · ${esc(i.flag || 'no clear suspect')} · <span class="pill ${i.status === 'recovered' ? 'ok' : i.status === 'waiting_approval' ? 'warn' : 'bad'}">${esc(i.status)}</span>
-      <div class="muted">${time(i.opened_at)}${st.suspect ? ` · ON ${fmt(st.suspect.onRate*100)} vs OFF ${fmt(st.suspect.offRate*100)}` : ''}</div>
+    const sus = st.suspect;
+    const who = abuse && st.abuse
+      ? `<div class="abuse">Errors come from ${st.abuse.excludedUsers.map(esc).join(', ')}${st.abuse.excludedSources.length ? ` and IP ${st.abuse.excludedSources.map(esc).join(', ')}` : ''}</div>` : '';
+    const label = abuse ? 'possible abuse' : i.status.replace(/_/g, ' ');
+    const pill = i.status === 'recovered' || i.status === 'blocked' ? 'ok' : waiting ? 'warn' : 'bad';
+    return `<div class="incident${abuse ? ' is-abuse' : ''}"><b>#${i.id}</b> · ${esc(i.flag || 'no clear suspect')} · <span class="pill ${pill}">${esc(waiting ? label : i.status === 'blocked' ? 'sources blocked' : label)}</span>
+      <div class="muted">${time(i.opened_at)}${sus ? ` · ON ${fmt(sus.onRate*100)} vs OFF ${fmt(sus.offRate*100)} · ${sus.onAffectedUsers ?? '?'} users affected` : ''}</div>
       ${i.status === 'recovered' ? `<div class="timing">Approved after <b>${secs(i.decided_at - i.opened_at)}</b> by ${esc(i.decided_by)} · Flagsmith delivered OFF in <b>${secs(i.propagated_at - i.disabled_at)}</b> · errors stopped <b>${secs(i.propagated_at - i.opened_at)}</b> after alert</div>` : ''}
-      <div class="exp">${esc(i.explanation || '')}</div>${buttons}</div>`;
+      ${who}<div class="exp">${esc(i.explanation || '')}</div>${investigation(i)}${buttons}</div>`;
   }).join('') : '<span class="muted">None yet. The agent is watching.</span>';
 
   $('audit').innerHTML = s.audit.map((a) => `<li><span class="t">${time(a.ts)}</span>${a.incident_id ? `#${a.incident_id} ` : ''}<b>${esc(a.step)}</b> ${esc(a.detail)}</li>`).join('');
+}
+
+const STEP = {
+  error_breakdown: (x) => `compared errors by ${x.by}`,
+  sample_errors: (x) => `read recent error messages${x.flag ? ` for ${x.flag}` : ''}`,
+  flag_changes: () => 'checked recent flag changes',
+  flags_for_user: (x) => `checked flags served to ${x.user_id}`,
+  flag_state: (x) => `read ${x.flag} in Flagsmith`,
+};
+function investigation(i) {
+  if (!i.trace) return i.decided_by_agent === 'maths' ? '<div class="by">Raised from the numbers only</div>' : '';
+  const t = JSON.parse(i.trace);
+  const steps = t.filter((s) => s.tool !== 'propose_action')
+    .map((s) => `<li>${esc(STEP[s.tool] ? STEP[s.tool](s.input || {}) : s.tool.startsWith('flagsmith_') ? `asked Flagsmith MCP: ${s.tool.slice(10)}` : s.tool)}</li>`).join('');
+  const p = (t.find((s) => s.tool === 'propose_action') || {}).input || {};
+  return `<details class="inv" open><summary>Investigated by Claude${i.confidence ? ` · ${esc(i.confidence)} confidence` : ''} · ${t.length - 1} checks</summary>
+    <ol>${steps}</ol>${p.reasoning ? `<div class="muted">Why: ${esc(p.reasoning)}</div>` : ''}</details>`;
 }
 
 async function refreshFlags() {
@@ -157,7 +194,18 @@ async function refreshFlags() {
       `<div class="flag">${esc(k)}: <b style="color:${v.enabled ? 'var(--ok)' : 'var(--bad)'}">${v.enabled ? 'ON' : 'OFF'}</b></div>`).join('');
   } catch { /* ignore */ }
 }
-refresh(); refreshFlags();
+async function refreshBlocklist() {
+  try {
+    const b = await (await fetch('/api/blocklist')).json();
+    const el = $('blocklist');
+    if (!b.users.length && !b.sources.length) { el.hidden = true; return; }
+    el.hidden = false;
+    el.innerHTML = `Blocked: ${b.users.map(esc).join(', ') || 'no users'}${b.sources.length ? ` · IP ${b.sources.map(esc).join(', ')}` : ''}
+      <button onclick="if (confirm('Unblock all sources? Blocked attackers will be able to reach the checkout again.')) post('/api/blocklist/clear')">Unblock all</button>`;
+  } catch { /* ignore */ }
+}
+refresh(); refreshFlags(); refreshBlocklist();
+setInterval(refreshBlocklist, 3000);
 setInterval(refresh, 2000); setInterval(refreshFlags, 5000);
 </script>
 </body>

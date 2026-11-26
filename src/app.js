@@ -2,13 +2,14 @@
 // Every request is logged with the flags that user saw, so the agent can work out which flag causes errors.
 import express from 'express';
 import { config } from './config.js';
-import { db, audit, getKv } from './db.js';
+import { db, audit, getKv, JUDGED } from './db.js';
 import { startFlags, getUserFlags } from './flags.js';
 import { enableFlag, getFlagState } from './flagsmithAdmin.js';
 
 startFlags();
 const app = express();
-app.use(express.json());
+app.set('trust proxy', config.protection.trustProxy);
+app.use(express.json({ limit: '10kb' }));
 app.use(express.static('public'));
 app.use('/vendor', express.static('node_modules/chart.js/dist')); // Chart.js served locally, no CDN needed
 
@@ -22,54 +23,97 @@ const BASELINE_ERROR_RATE = 0.01; // background noise every real app has
 function oldCheckout() {
   if (demo.allBroken && Math.random() < demo.failRate) throw new Error('database connection refused');
   if (Math.random() < BASELINE_ERROR_RATE) throw new Error('payment gateway timeout');
-  return { version: 'old', total: 499 };
+  return { version: 'old', total: 2450 };
 }
 
-function newCheckout() {
+function newCheckout(input) {
+  // A real bug in the new code: very long coupon codes crash it. An attacker who finds this can exploit it.
+  if (input.coupon && input.coupon.length > 40) throw new Error('RangeError: coupon code overflowed the discount table');
   if (demo.allBroken && Math.random() < demo.failRate) throw new Error('database connection refused');
   if (demo.newCheckoutBroken && Math.random() < demo.failRate) {
     throw new Error('TypeError: cannot read properties of undefined (reading "couponCode")');
   }
   if (Math.random() < BASELINE_ERROR_RATE) throw new Error('payment gateway timeout');
-  return { version: 'new', total: 449, savedWith: 'one-click checkout' };
+  return { version: 'new', total: 2350, savedWith: 'one-tap UPI' };
 }
 
 const insertEvent = db.prepare(
-  'INSERT INTO events (ts, user_id, route, ok, latency_ms, flags) VALUES (?, ?, ?, ?, ?, ?)'
+  'INSERT INTO events (ts, user_id, route, ok, latency_ms, flags, status, source, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
 );
+const log = (userId, ok, status, started, flags, source, error = null) =>
+  insertEvent.run(Date.now(), userId, 'checkout', ok, Date.now() - started, JSON.stringify(flags), status, source, error && String(error).slice(0, 200));
+
+// ---- Protection --------------------------------------------------------------------------
+// Sliding one-minute window per key. Requests over the limit get 429 and don't count as errors.
+// Token bucket: `perMinute` requests a minute, refilled smoothly, with a small burst allowance (1/6 of the minute).
+// So an attacker can't fire a whole minute's allowance in one second.
+const buckets = new Map();
+function overLimit(key, perMinute) {
+  const now = Date.now();
+  const capacity = Math.max(3, Math.ceil(perMinute / 6));
+  const b = buckets.get(key) || { tokens: capacity, at: now };
+  b.tokens = Math.min(capacity, b.tokens + ((now - b.at) / 60000) * perMinute);
+  b.at = now;
+  buckets.set(key, b);
+  if (b.tokens < 1) return true;
+  b.tokens -= 1;
+  return false;
+}
+setInterval(() => { const now = Date.now(); for (const [k, b] of buckets) if (now - b.at > 120000) buckets.delete(k); }, 60000).unref();
+
+// Sources a human chose to block from an abuse alert (stored by the agent in the kv table).
+let blockCache = { at: 0, users: new Set(), sources: new Set() };
+function blocked() {
+  if (Date.now() - blockCache.at > 2000) {
+    const b = JSON.parse(getKv('blocklist') || '{"users":[],"sources":[]}');
+    blockCache = { at: Date.now(), users: new Set(b.users), sources: new Set(b.sources) };
+  }
+  return blockCache;
+}
+
+// In a real app the user comes from the login session; this demo takes it from the request.
+const USER_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 app.post('/api/checkout', async (req, res) => {
-  const userId = String(req.body?.userId || 'anonymous');
   const started = Date.now();
+  const source = req.ip;
+  const body = req.body || {};
+  const userId = String(body.userId || '');
+
+  // 1. Bad input is the caller's fault, not a bug: 400, not counted as an error.
+  if (!USER_ID.test(userId) || (body.coupon !== undefined && (typeof body.coupon !== 'string' || body.coupon.length > 200))) {
+    log(userId.slice(0, 64) || 'invalid', 1, 400, started, {}, source);
+    return res.status(400).json({ ok: false, error: 'Invalid request: check userId and coupon' });
+  }
+  // 2. Blocked by a human after an abuse alert.
+  const bl = blocked();
+  if (bl.users.has(userId) || bl.sources.has(source)) {
+    log(userId, 1, 403, started, {}, source);
+    return res.status(403).json({ ok: false, error: 'Blocked after suspected abuse' });
+  }
+  // 3. Rate limits: one shopper or one IP can't flood the checkout.
+  if (overLimit(`u:${userId}`, config.protection.perUserPerMinute) || overLimit(`s:${source}`, config.protection.perSourcePerMinute)) {
+    log(userId, 1, 429, started, {}, source);
+    return res.status(429).json({ ok: false, error: 'Too many checkouts, slow down' });
+  }
+
   let flags = {};
   try {
     flags = await getUserFlags(userId); // Flagsmith decides which version this user gets
-    const result = flags.new_checkout ? newCheckout() : oldCheckout();
+    const result = flags.new_checkout ? newCheckout(body) : oldCheckout();
     const banner = flags.new_search_banner ? 'New: smarter search!' : null; // harmless second flag
-    insertEvent.run(Date.now(), userId, 'checkout', 1, Date.now() - started, JSON.stringify(flags));
+    log(userId, 1, 200, started, flags, source);
     res.json({ ok: true, ...result, banner });
   } catch (err) {
-    insertEvent.run(Date.now(), userId, 'checkout', 0, Date.now() - started, JSON.stringify(flags));
+    log(userId, 0, 500, started, flags, source, err.message); // only real server failures count as errors
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// A page a person can open to see which checkout they get.
-app.get('/shop', async (req, res) => {
-  const userId = String(req.query.user || 'visitor-1');
-  const flags = await getUserFlags(userId);
-  res.send(`<!doctype html><meta name=viewport content="width=device-width"><title>Demo Shop</title><link rel="icon" href="data:,">
-  <body style="font-family:system-ui;max-width:520px;margin:40px auto;padding:0 16px">
-  ${flags.new_search_banner ? '<div style="background:#e7f1fb;padding:8px 12px;border-radius:8px">New: smarter search!</div>' : ''}
-  <h1>Demo Shop</h1><p>Signed in as <b>${userId.replace(/[<>&"]/g, '')}</b></p>
-  <div style="border:2px solid ${flags.new_checkout ? '#2f9e44' : '#868e96'};border-radius:12px;padding:16px">
-  <h2>${flags.new_checkout ? 'New one-click checkout' : 'Classic checkout'}</h2>
-  <p>Wireless earbuds: ₹${flags.new_checkout ? '449' : '499'}</p>
-  <small>Flag <code>new_checkout</code> is <b>${flags.new_checkout ? 'ON' : 'OFF'}</b> for this user</small></div>
-  <p style="margin-top:20px">Try another shopper:
-  ${['user-1', 'user-2', 'user-3', 'user-4', 'user-5', 'user-6', 'user-7', 'user-8'].map((u) => `<a href="/shop?user=${u}">${u}</a>`).join(' · ')}</p>
-  <p style="color:#666;font-size:13px">Each shopper always gets the same answer from Flagsmith. About 20% are in the <code>checkout_holdout</code> segment and keep the classic checkout.</p>
-  <p><a href="/">Open the live dashboard</a></p></body>`);
+// The storefront (public/shop.html) asks which flags a shopper gets, then calls /api/checkout.
+app.get('/shop', (_req, res) => res.sendFile('shop.html', { root: 'public' }));
+app.get('/api/shop/flags', async (req, res) => {
+  res.json(await getUserFlags(String(req.query.user || 'user-1')));
 });
 
 // ---- Dashboard data -------------------------------------------------------------------
@@ -81,11 +125,15 @@ app.get('/api/stats', (req, res) => {
     `SELECT (ts / ${bucketMs}) * ${bucketMs} AS t, COUNT(*) AS total, SUM(ok = 0) AS errors,
             SUM(json_extract(flags, '$.new_checkout') = 1) AS on_total,
             SUM(json_extract(flags, '$.new_checkout') = 1 AND ok = 0) AS on_errors
-     FROM events WHERE ts >= ? GROUP BY t ORDER BY t`
+     FROM events WHERE ts >= ? AND ${JUDGED} GROUP BY t ORDER BY t`
   ).all(since);
+  const rejected = db.prepare(
+    `SELECT COUNT(*) AS n, SUM(status = 429) AS limited, SUM(status = 403) AS blocked, SUM(status = 400) AS invalid
+     FROM events WHERE ts >= ? AND status >= 400 AND status < 500`
+  ).get(Date.now() - 60000);
   const incidents = db.prepare('SELECT * FROM incidents ORDER BY id DESC LIMIT 5').all();
   const auditRows = db.prepare('SELECT * FROM audit_log ORDER BY id DESC LIMIT 25').all();
-  res.json({ series: rows, incidents, audit: auditRows, demo, localTestMode: config.localTestMode, dashboardApproval: dashboardApproval() });
+  res.json({ series: rows, rejected, incidents, audit: auditRows, demo, localTestMode: config.localTestMode, dashboardApproval: dashboardApproval() });
 });
 
 let flagCache = { at: 0, data: null };
@@ -111,10 +159,11 @@ app.post('/api/incidents/:id/decision', (req, res) => {
     return res.status(403).json({ error: 'Approvals happen in Slack (set ALLOW_DASHBOARD_APPROVAL=true to allow the dashboard)' });
   }
   const { decision, by } = req.body || {};
-  if (!['approve', 'ignore'].includes(decision)) return res.status(400).json({ error: 'decision must be approve or ignore' });
+  const statusFor = { approve: 'approved', ignore: 'ignored', block: 'block_requested' };
+  if (!statusFor[decision]) return res.status(400).json({ error: 'decision must be approve, ignore or block' });
   const r = db.prepare(
     `UPDATE incidents SET status = ?, decided_by = ?, decided_at = ? WHERE id = ? AND status = 'waiting_approval'`
-  ).run(decision === 'approve' ? 'approved' : 'ignored', by || 'dashboard', Date.now(), req.params.id);
+  ).run(statusFor[decision], by || 'dashboard', Date.now(), req.params.id);
   if (!r.changes) return res.status(409).json({ error: 'incident is not waiting for approval' });
   audit(Number(req.params.id), `decision:${decision}`, `by ${by || 'dashboard'}`);
   res.json({ ok: true });
@@ -143,11 +192,23 @@ app.post('/api/demo/reset', async (_req, res) => {
   demo.allBroken = false;
   try {
     await enableFlag('new_checkout');
-    audit(null, 'demo:reset', 'bug fixed and new_checkout switched back on');
+    db.prepare('INSERT INTO flag_history (ts, flag, note) VALUES (?, ?, ?)').run(Date.now(), 'new_checkout', 'switched ON by Reset demo');
+    // Blocked sources stay blocked: unblocking is a separate, deliberate action.
+    audit(null, 'demo:reset', 'bug fixed and new_checkout switched back on (blocked sources stay blocked)');
     res.json({ ok: true });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
+});
+
+// Who is blocked right now, and a deliberate "unblock all".
+app.get('/api/blocklist', (_req, res) => res.json(JSON.parse(getKv('blocklist') || '{"users":[],"sources":[]}')));
+app.post('/api/blocklist/clear', (req, res) => {
+  const before = JSON.parse(getKv('blocklist') || '{"users":[],"sources":[]}');
+  db.prepare("DELETE FROM kv WHERE k = 'blocklist'").run();
+  blockCache.at = 0;
+  audit(null, 'unblocked', `by ${req.body?.by || 'dashboard'}: users ${before.users.join(', ') || '-'} · IPs ${before.sources.join(', ') || '-'}`);
+  res.json({ ok: true });
 });
 
 app.listen(config.port, () => {

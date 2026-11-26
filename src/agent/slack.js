@@ -35,6 +35,7 @@ export async function startSlack() {
     await ack();
     const incidentId = Number(action.value);
     const userId = body.user.id;
+    const who = body.user.username || body.user.name || userId; // readable name for the dashboard and report
     const allowed = !config.slack.approvers.length || config.slack.approvers.includes(userId);
     if (!allowed) {
       await client.chat.postEphemeral({ channel: body.channel.id, user: userId, text: 'You are not on the approver list for flag changes.' });
@@ -43,9 +44,9 @@ export async function startSlack() {
     }
     const r = db.prepare(
       `UPDATE incidents SET status = ?, decided_by = ?, decided_at = ? WHERE id = ? AND status = 'waiting_approval'`
-    ).run(decision === 'approve' ? 'approved' : 'ignored', `slack:${userId}`, Date.now(), incidentId);
+    ).run({ approve: 'approved', ignore: 'ignored', block: 'block_requested' }[decision], `${who} (Slack)`, Date.now(), incidentId);
     if (!r.changes) return; // already decided (double click or dashboard)
-    audit(incidentId, `decision:${decision}`, `by slack user ${userId}`);
+    audit(incidentId, `decision:${decision}`, `by ${who} in Slack`);
     await client.chat.update({
       channel: body.channel.id,
       ts: body.message.ts,
@@ -53,12 +54,15 @@ export async function startSlack() {
       blocks: [
         ...body.message.blocks.filter((b) => b.type !== 'actions'),
         { type: 'context', elements: [{ type: 'mrkdwn',
-          text: decision === 'approve' ? `:white_check_mark: Approved by <@${userId}>. Switching the flag off…` : `:no_entry_sign: Ignored by <@${userId}>.` }] },
+          text: { approve: `:white_check_mark: Approved by <@${userId}>. Switching the flag off…`,
+                  block: `:shield: <@${userId}> chose to block the sources. The flag stays ON.`,
+                  ignore: `:no_entry_sign: Ignored by <@${userId}>.` }[decision] }] },
       ],
     });
   };
   app.action('approve_kill', decide('approve'));
   app.action('ignore_kill', decide('ignore'));
+  app.action('block_sources', decide('block'));
 
   const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('no connection after 15s')), 15000));
   const starting = app.start();
@@ -76,11 +80,33 @@ export async function startSlack() {
   }
 }
 
+// One line per tool call, so the reader sees how the agent reached its proposal.
+const TOOL_LABEL = {
+  error_breakdown: (i) => `compared errors by ${i.by}`,
+  sample_errors: (i) => `read recent error messages${i.flag ? ` for ${i.flag}` : ''}`,
+  flag_changes: () => 'checked recent flag changes',
+  flags_for_user: (i) => `checked flags served to ${i.user_id}`,
+  flag_state: (i) => `read ${i.flag} in Flagsmith`,
+};
+export function describeStep(t) {
+  if (TOOL_LABEL[t.tool]) return TOOL_LABEL[t.tool](t.input || {});
+  if (t.tool.startsWith('flagsmith_')) return `asked Flagsmith MCP: ${t.tool.replace('flagsmith_', '')}`;
+  return t.tool;
+}
+function investigationBlock(incident) {
+  if (!incident.trace?.length) return [];
+  const steps = incident.trace.filter((t) => t.tool !== 'propose_action').map((t, n) => `${n + 1}. ${describeStep(t)}`).join('\n');
+  return [{ type: 'context', elements: [{ type: 'mrkdwn',
+    text: `*How I investigated* (${incident.byAgent === 'claude' ? `Claude, ${incident.confidence} confidence` : 'numbers only'})\n${steps}` }] }];
+}
+
 export async function postAlert(incident, analysis) {
+  if (analysis.kind === 'abuse') return postAbuseAlert(incident, analysis);
   const s = analysis.suspect;
   const headline = s ? `:rotating_light: Errors spiking. Suspect flag: \`${s.flag}\`` : ':warning: Errors spiking with no clear flag to blame';
   if (!app) {
-    console.log(`\n${'='.repeat(70)}\n${headline}\n${incident.explanation}\n` +
+    const steps = (incident.trace || []).filter((t) => t.tool !== 'propose_action').map((t, n) => `  ${n + 1}. ${describeStep(t)}`).join('\n');
+    console.log(`\n${'='.repeat(70)}\n${headline}\n${incident.explanation}\n` + (steps ? `How I investigated:\n${steps}\n` : '') +
       (s ? `Approve on the dashboard: ${config.appUrl}/  (incident #${incident.id})` : '') + `\n${'='.repeat(70)}\n`);
     return null;
   }
@@ -92,6 +118,8 @@ export async function postAlert(incident, analysis) {
     blocks.push({ type: 'section', fields: [
       { type: 'mrkdwn', text: `*Error rate, flag ON*\n${(s.onRate * 100).toFixed(1)}% (${s.onErrors}/${s.onTotal})` },
       { type: 'mrkdwn', text: `*Error rate, flag OFF*\n${(s.offRate * 100).toFixed(1)}% (${s.offErrors}/${s.offTotal})` },
+      { type: 'mrkdwn', text: `*Users affected, flag ON*\n${s.onAffectedUsers} of ${s.onUsers}` },
+      { type: 'mrkdwn', text: `*Users affected, flag OFF*\n${s.offAffectedUsers} of ${s.offUsers}` },
     ] });
     blocks.push({ type: 'actions', elements: [
       { type: 'button', style: 'danger', action_id: 'approve_kill', value: String(incident.id),
@@ -102,6 +130,7 @@ export async function postAlert(incident, analysis) {
       { type: 'button', action_id: 'ignore_kill', value: String(incident.id), text: { type: 'plain_text', text: 'Ignore' } },
     ] });
   }
+  blocks.push(...investigationBlock(incident));
   blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Incident #${incident.id} · <${config.appUrl}/|Live dashboard>` }] });
   const res = await app.client.chat.postMessage({ channel: config.slack.channel, text: headline, blocks });
   return res.ts;
@@ -110,4 +139,41 @@ export async function postAlert(incident, analysis) {
 export async function postFollowUp(threadTs, text) {
   if (!app) { console.log(`[slack:console] ${text}`); return; }
   await app.client.chat.postMessage({ channel: config.slack.channel, thread_ts: threadTs || undefined, text });
+}
+
+// Errors concentrated in a few users/IPs: suggest blocking them, keep "turn off" as a deliberate override.
+async function postAbuseAlert(incident, a) {
+  const ab = a.abuse;
+  const flag = a.suspect?.flag;
+  const headline = `:shield: Possible abuse${flag ? ` on \`${flag}\`` : ''}: errors come from a few sources`;
+  const sources = [
+    ...ab.users.top.map((t) => `user \`${t.id}\`: ${t.errors} errors`),
+    ...ab.sources.top.slice(0, ab.excludedSources.length).map((t) => `IP \`${t.id}\`: ${t.errors} errors`),
+  ].join('\n');
+  if (!app) {
+    console.log(`\n${'='.repeat(70)}\n${headline}\n${incident.explanation}\n${sources.replace(/`/g, '')}\n` +
+      `Decide on the dashboard: ${config.appUrl}/  (incident #${incident.id})\n${'='.repeat(70)}\n`);
+    return null;
+  }
+  const actions = [
+    { type: 'button', style: 'primary', action_id: 'block_sources', value: String(incident.id),
+      text: { type: 'plain_text', text: 'Block these sources' } },
+  ];
+  if (flag) {
+    actions.push({ type: 'button', action_id: 'approve_kill', value: String(incident.id),
+      text: { type: 'plain_text', text: `Turn off ${flag} anyway` },
+      confirm: { title: { type: 'plain_text', text: 'Turn off anyway?' },
+        text: { type: 'mrkdwn', text: `Errors come from a few sources, not your users. Turning off \`${flag}\` affects everyone.` },
+        confirm: { type: 'plain_text', text: 'Turn it off' }, deny: { type: 'plain_text', text: 'Cancel' } } });
+  }
+  actions.push({ type: 'button', action_id: 'ignore_kill', value: String(incident.id), text: { type: 'plain_text', text: 'Ignore' } });
+  const res = await app.client.chat.postMessage({ channel: config.slack.channel, text: headline, blocks: [
+    { type: 'header', text: { type: 'plain_text', text: 'Possible abuse, not a bug' } },
+    { type: 'section', text: { type: 'mrkdwn', text: incident.explanation } },
+    { type: 'section', text: { type: 'mrkdwn', text: `*Where the errors come from*\n${sources}` } },
+    { type: 'actions', elements: actions },
+    ...investigationBlock(incident),
+    { type: 'context', elements: [{ type: 'mrkdwn', text: `Incident #${incident.id} · <${config.appUrl}/|Live dashboard>` }] },
+  ] });
+  return res.ts;
 }

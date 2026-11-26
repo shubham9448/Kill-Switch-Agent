@@ -8,14 +8,27 @@ Built for *Toggle Wars: The Flagsmith Experimentation Hackathon*, Track 02 (AI A
 
 Teams ship new features behind flags so they can roll back fast. But at 2 AM someone still has to notice the errors, work out which feature caused them, find the right flag and switch it off. That takes 20 to 40 minutes. The Kill Switch Agent cuts it to one tap in Slack, and a human still makes the final call.
 
+## Who decides what
+
+| Step | Done by | Why |
+| --- | --- | --- |
+| Spot an error spike | **Maths**, every 10s | Fast, free, never tired |
+| Investigate: which flag, who is failing, what the errors say, what changed in Flagsmith | **Claude**, with read-only tools (Flagsmith MCP + event data) | Judgement: tells a feature bug from an attack or an outage |
+| Propose one action: turn off flag, block sources, escalate, keep watching | **Claude** | |
+| Check the proposal against the evidence | **Guardrails** (plain code) | Claude can't offer a kill the numbers don't back, or block someone who isn't causing errors |
+| Approve | **A human**, in Slack | Every change to Flagsmith needs a person |
+| Switch the flag off and confirm recovery | **The agent**, through the Flagsmith Admin API | Only after approval |
+
+Claude never gets a tool that changes Flagsmith. Its Flagsmith MCP tools are a read-only allow-list (`get_feature_flag`, `list_project_features`, segment reads, and so on); `update_*`, `create_*` and `delete_*` are never exposed. If Claude is slow or unavailable, the alert still goes out from the numbers alone.
+
 ## Track 02 criteria at a glance
 
 | Judges look for | How this project does it |
 | --- | --- |
-| Flagsmith CLI, API or MCP server | The **Flagsmith Admin API** switches the flag off and reads its state (`src/flagsmithAdmin.js`). The **Node SDK** with local evaluation reads per-user flags (`src/flags.js`). |
-| Saves real time | Detects the guilty flag within about 10s of errors starting. One tap switches it off. The agent then measures how long Flagsmith takes to deliver the change (about 35s in our live test) and confirms recovery. The dashboard and each report show the measured times. |
-| A human approves changes | The agent never changes a flag on its own. Slack **Turn off** button with a confirm dialog, plus an optional approver list. The dashboard backup unlocks only if Slack isn't set up or is down. |
-| Clear output | A 3-line Slack alert with the ON vs OFF evidence, a recovery summary in the thread, a Markdown **incident report** per incident (`reports/incident-N.md`), and a live dashboard. |
+| Flagsmith CLI, API or MCP server | **All three ways in:** the **Flagsmith MCP server** gives the investigator read-only access (`src/flagsmithMcp.js`), the **Admin API** switches the flag off (`src/flagsmithAdmin.js`), and the **Node SDK** with local evaluation serves per-user flags (`src/flags.js`). |
+| Saves real time | The investigator finishes in 5–11 seconds. Detects the guilty flag within about 10s of errors starting. One tap switches it off. The agent then measures how long Flagsmith takes to deliver the change (about 35s in our live test) and confirms recovery. The dashboard and each report show the measured times. |
+| A human approves changes | The agent never changes a flag on its own. It also spots attacks meant to trick it into a rollback, and suggests blocking the attacker instead. Slack **Turn off** button with a confirm dialog, plus an optional approver list. The dashboard backup unlocks only if Slack isn't set up or is down. |
+| Clear output | The investigation steps and Claude's reasoning on every alert, a 3-line Slack alert with the ON vs OFF evidence, a recovery summary in the thread, a Markdown **incident report** per incident (`reports/incident-N.md`), and a live dashboard. |
 
 ## How it works
 
@@ -94,7 +107,7 @@ Open http://localhost:3000, click **Break new checkout**, wait for the incident,
 5. Create a channel such as `#incidents`, run `/invite @YourApp` there, and copy its channel ID → `SLACK_CHANNEL_ID`.
 6. Optional: `SLACK_APPROVER_IDS` = your Slack member ID, so only you can approve.
 
-**3. Claude** (optional): set `ANTHROPIC_API_KEY`. Without it, a plain template message is used.
+**3. Claude** (recommended): set `ANTHROPIC_API_KEY`. It powers the investigator. Without it, alerts are raised from the numbers alone with a template message.
 
 **4. Check and run**
 
@@ -109,13 +122,42 @@ Before recording a demo, run `npm run clean` (with the app stopped) to clear old
 
 ## Tests
 
+**Investigator eval with real Claude:** `npm run eval` runs 5 scenarios 3 times each and saves a scorecard to `eval-results.md`.
+
+Latest result: **15/15 correct** with `claude-sonnet-5-5` using the live Flagsmith MCP server (7 read-only tools). Each investigation took 5–11 seconds and 4–6 checks.
+
+| Scenario | Correct proposal | Result |
+| --- | --- | --- |
+| New checkout bug | Turn off `new_checkout` | 3/3 |
+| Attack from 3 accounts | Block those sources | 3/3 |
+| Database outage | Escalate: no flag at fault | 3/3 |
+| Bug and attack at once | Turn off `new_checkout` | 3/3 |
+| Two flags changed, one broken | Turn off `new_checkout` only | 3/3 |
+
+An earlier run scored 12/15. In all three misses, the investigator spotted that our test data was broken: the "attack" scenario was accidentally failing 100% of requests with gateway timeouts. It correctly escalated it as an outage and explained why. We fixed the test data and added a sanity check.
+
+
 ```bash
 npm test
 ```
 
-Unit tests cover the blame logic: no false alarm on normal traffic or low traffic, blaming the right flag and not the innocent one, waiting for more data instead of raising a false alarm, reporting "no flag to blame" when everything fails, and flags with no OFF group.
+Unit tests (11) cover the blame logic and abuse protection: attack-only is flagged as possible abuse (even from many IPs), a spread-out bug is still blamed, a bug plus an attack still finds the bug, and fewer than 10 affected users is never blamed. Earlier tests cover no false alarm on normal traffic or low traffic, blaming the right flag and not the innocent one, waiting for more data instead of raising a false alarm, reporting "no flag to blame" when everything fails, and flags with no OFF group.
 
-End-to-end scenarios checked in local test mode: break → detect (about 8s) → approve → flag off → recovered → report written; Ignore → snoozed with no repeat alert; whole-app outage → no flag blamed; no repeat alarm while a killed flag stays off; demo reset; wrong Slack tokens / no network → agent keeps running and the dashboard approval unlocks; Slack connected → dashboard approval refused.
+End-to-end scenarios checked in local test mode: attack only → possible abuse → Block → all attacker requests refused, flag untouched; bug plus attack → abuse alert replaced by the bug alert → recovered while the attack continued; malformed requests → all rejected, no incident; break → detect (about 8s) → approve → flag off → recovered → report written; Ignore → snoozed with no repeat alert; whole-app outage → no flag blamed; no repeat alarm while a killed flag stays off; demo reset; wrong Slack tokens / no network → agent keeps running and the dashboard approval unlocks; Slack connected → dashboard approval refused.
+
+## It can't be tricked into rolling back your feature
+
+What if someone attacks the new checkout on purpose, so the agent switches off a feature that works fine for everyone else?
+
+- **A plain flood (DoS)** makes everyone fail, flag ON or OFF alike, so no flag is blamed.
+- **Only real failures count.** Malformed input gets `400` and isn't counted as an error. Each shopper and each IP is rate-limited (`429`).
+- **The agent counts people, not just requests.** A flag is blamed only if both requests *and* distinct users point at it, with at least 10 different users affected.
+- **Concentration check.** If the top 3 users or top 3 IPs cause more than half the errors, the alert says *possible abuse, not a bug*. It names the sources and offers **Block these sources** (the flag stays ON), with **Turn off anyway** kept as a deliberate human override.
+- **Bug and attack at the same time.** The agent sets the heavy sources aside and judges everyone else. A real bug still gets blamed, and a waiting abuse alert is replaced by the bug alert.
+
+Try it: `npm start -- --sim`, then in a second terminal `npm run attack`.
+
+**Honest limit:** an attacker with hundreds of real accounts on many networks looks like real users. Two safety nets remain: a human must approve, and the worst case is a reversible rollback to the old checkout, not an outage.
 
 ## Safety choices
 
@@ -135,7 +177,11 @@ src/agent/attribution.js the blame maths
 src/agent/explain.js     Claude explanation with template fallback
 src/agent/slack.js       Slack alert + Approve/Ignore buttons
 src/agent/report.js      Markdown incident report
-src/simulate.js          traffic simulator
+src/agent/investigate.js the investigator: Claude's tool loop + guardrails
+src/agent/tools.js       the investigator's read-only tools
+src/flagsmithMcp.js      Flagsmith MCP client (read-only allow-list)
+src/eval.js              real-Claude scorecard (npm run eval)
+src/simulate.js          traffic simulator (also --attack and --junk modes; npm run attack)
 src/check-setup.js       connection checker
 public/index.html        live dashboard
 test/                    unit tests

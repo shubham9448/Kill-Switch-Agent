@@ -37,6 +37,16 @@ CREATE TABLE IF NOT EXISTS incidents (
 
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
 
+-- Flag changes the agent saw in Flagsmith (it snapshots flag states every 30s).
+CREATE TABLE IF NOT EXISTS flag_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  flag TEXT NOT NULL,
+  enabled INTEGER,
+  segment_overrides INTEGER,
+  note TEXT
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,
@@ -47,7 +57,19 @@ CREATE TABLE IF NOT EXISTS audit_log (
 `);
 
 // Added after the first version: when the OFF state actually reached the app.
-try { db.exec('ALTER TABLE incidents ADD COLUMN propagated_at INTEGER'); } catch { /* already there */ }
+for (const sql of [
+  'ALTER TABLE incidents ADD COLUMN propagated_at INTEGER', // when the OFF state actually reached the app
+  "ALTER TABLE incidents ADD COLUMN kind TEXT DEFAULT 'bug'", // bug | abuse | no_suspect
+  'ALTER TABLE events ADD COLUMN status INTEGER',           // HTTP status: only 5xx counts as an error
+  'ALTER TABLE events ADD COLUMN source TEXT',              // client IP
+  'ALTER TABLE events ADD COLUMN error TEXT',               // error message, for the investigator
+  'ALTER TABLE incidents ADD COLUMN trace TEXT',            // the investigator's steps (JSON)
+  'ALTER TABLE incidents ADD COLUMN confidence TEXT',       // high | medium | low
+  'ALTER TABLE incidents ADD COLUMN decided_by_agent TEXT', // 'claude' or 'maths' (fallback)
+]) { try { db.exec(sql); } catch { /* column already there */ } }
+
+// Requests the agent should judge: successes and server errors. Rejected input (4xx) is the caller's fault, not a bug.
+export const JUDGED = '(status IS NULL OR status < 400 OR status >= 500)';
 
 export function audit(incidentId, step, detail = '') {
   db.prepare('INSERT INTO audit_log (ts, incident_id, step, detail) VALUES (?, ?, ?, ?)')

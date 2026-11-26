@@ -58,5 +58,24 @@ else {
     ok(`Model ${config.claude.model} replied: ${m.content[0]?.text}`);
   } catch (e) { bad(`Claude call failed: ${e.message}`); }
 }
+
+console.log('\nInvestigator');
+if (!config.claude.apiKey || !config.claude.investigator) skip('Off: alerts are raised from the numbers only');
+else {
+  try {
+    const { default: Anthropic } = await import('@anthropic-ai/sdk');
+    await new Anthropic({ apiKey: config.claude.apiKey }).messages.create({
+      model: config.claude.investigatorModel, max_tokens: 10, messages: [{ role: 'user', content: 'Reply with OK' }] });
+    ok(`Investigator model ${config.claude.investigatorModel} works`);
+  } catch (e) { bad(`Investigator model ${config.claude.investigatorModel}: ${e.message} (set INVESTIGATOR_MODEL in .env)`); }
+  if (!f.mcpUrl) skip('Flagsmith MCP turned off (FLAGSMITH_MCP_URL is empty): the investigator uses the Admin API');
+  else {
+    const { connectFlagsmithMcp, mcpToolsForClaude } = await import('./flagsmithMcp.js');
+    await connectFlagsmithMcp();
+    const t = mcpToolsForClaude();
+    t.length ? ok(`Flagsmith MCP connected: ${t.length} read-only tools (${t.map((x) => x.name.replace('flagsmith_', '')).join(', ')})`)
+      : bad('Flagsmith MCP did not connect; the investigator will use the Admin API instead (still works)');
+  }
+}
 console.log('');
 process.exit(0);

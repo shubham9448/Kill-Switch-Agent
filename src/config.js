@@ -23,6 +23,8 @@ export const config = {
     projectId: process.env.FLAGSMITH_PROJECT_ID,
     apiUrl: (process.env.FLAGSMITH_API_URL || 'https://api.flagsmith.com/api/v1/').replace(/\/?$/, '/'),
     refreshSeconds: num(process.env.FLAGSMITH_REFRESH_SECONDS, 5),
+    // Flagsmith's hosted MCP server. The investigator uses its read-only tools. Set empty to turn off.
+    mcpUrl: process.env.FLAGSMITH_MCP_URL ?? 'https://mcp.flagsmith.com',
     // Flags the app reports with every event. The agent can blame any of them.
     watchedFlags: list(process.env.WATCHED_FLAGS || 'new_checkout,new_search_banner'),
   },
@@ -36,6 +38,17 @@ export const config = {
     blameRatio: num(process.env.BLAME_RATIO, 3),
     verifyAfterSeconds: num(process.env.VERIFY_AFTER_SECONDS, 30),
     snoozeMinutes: num(process.env.SNOOZE_MINUTES, 5),
+    // Abuse protection: a real bug hurts many users; an attack comes from a few sources.
+    minAffectedUsers: num(process.env.MIN_AFFECTED_USERS, 10),
+    concentrationShare: num(process.env.CONCENTRATION_SHARE, 0.5), // top 3 users or top 3 IPs causing more than this share of errors = suspicious
+  },
+
+  protection: {
+    perUserPerMinute: num(process.env.RATE_LIMIT_PER_USER, 30),
+    perSourcePerMinute: num(process.env.RATE_LIMIT_PER_IP, 120),
+    // Which proxies to trust for the client IP (X-Forwarded-For). "loopback" = only from this machine (the simulator).
+    // Behind a load balancer in production, set this to the number of proxy hops instead.
+    trustProxy: process.env.TRUST_PROXY || 'loopback',
   },
 
   slack: {
@@ -53,5 +66,9 @@ export const config = {
   claude: {
     apiKey: process.env.ANTHROPIC_API_KEY,
     model: process.env.CLAUDE_MODEL || 'claude-haiku-5-5',
+    // The investigator: Claude investigates each alarm with tools and proposes an action. false = maths-only alerts.
+    investigator: process.env.INVESTIGATOR !== 'false',
+    investigatorModel: process.env.INVESTIGATOR_MODEL || 'claude-sonnet-5-5',
+    investigatorTimeoutSeconds: num(process.env.INVESTIGATOR_TIMEOUT_SECONDS, 45),
   },
 };

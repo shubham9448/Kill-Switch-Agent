@@ -10,7 +10,9 @@
     "check": "node src/check-setup.js",
     "test": "node --test \"test/**/*.test.js\"",
     "start": "node src/start-all.js",
-    "clean": "node -e \"for (const d of ['data','reports']) require('fs').rmSync(d,{recursive:true,force:true}); console.log('Cleared incident history and reports')\""
+    "clean": "node -e \"for (const d of ['data','reports']) require('fs').rmSync(d,{recursive:true,force:true}); console.log('Cleared incident history and reports')\"",
+    "attack": "node src/simulate.js --attack-only",
+    "eval": "node src/eval.js"
   },
   "engines": {
     "node": ">=20"
@@ -19,10 +21,12 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^1.13.0",
     "@flagsmith/nodejs": "^9.5.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@slack/bolt": "^4.7.3",
     "better-sqlite3": "^12.11.1",
     "chart.js": "^4.6.2",
     "dotenv": "^18.0.10",
-    "express": "^5.3.0"
+    "express": "^5.3.0",
+    "zod": "^4.6.7"
   }
 }
